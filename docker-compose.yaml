@@ -1,0 +1,33 @@
+version: "3"
+services:
+  postgres:
+    image: postgres:14.5
+    container_name: postgres
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+
+  app:
+    image: cyberdetector:latest
+    build: .
+    container_name: cyberdetector
+    ports:
+      - "80:80"
+    depends_on:
+        - postgres
+    environment:
+      CONSUMER_KEY: "CONSUMER_KEY"
+      CONSUMER_SECRET: "CONSUMER_SECRET"
+      ACCESS_TOKEN: "ACCESS_TOKEN"
+      ACCESS_TOKEN_SECRET: "ACCESS_TOKEN_SECRET"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: "postgres"
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      GRACEFUL_TIMEOUT: "300"
+      TIMEOUT: "300"
+      LOG_LEVEL: "DEBUG"
