@@ -10,6 +10,13 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_DB: postgres
 
+  redis:
+    image: redis:7.0.5
+    container_name: redis
+    volumes:
+      - ./redis:/data
+    command: redis-server --appendonly yes
+
   app:
     image: cyberdetector:latest
     build: .

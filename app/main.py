@@ -1,12 +1,17 @@
+import uuid
 from datetime import datetime, timezone
 from os import getenv
 
 import psycopg2 as pg
+import psycopg2.errors
 import tweepy
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Union
 from dotenv import load_dotenv
+import redis
+import logging
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = FastAPI()
 
@@ -50,6 +55,9 @@ class User:
             user=getenv("POSTGRES_USER"),
             password=getenv("POSTGRES_PASSWORD"),
         )
+        self.redis = redis.Redis(
+            host=getenv("REDIS_HOST"), port=int(getenv("REDIS_PORT")), db=0
+        )
         self.username = username
         self.id = self.api.get_user(screen_name=self.username).id
 
@@ -61,7 +69,11 @@ class User:
         self.account_age = self.get_user_account_age()
         self.followers_to_following_ratio = self.get_user_followers_to_following_ratio()
         self.verified_followers = self.find_verified_followers_count()
+        self.set_redis_job()
         self.create_user_table()
+
+    def set_redis_job(self):
+        self.redis.set(self.username, "queued",ex=10800)
 
     def create_user_table(self):
         cursor = self.postgres_connection.cursor()
@@ -86,8 +98,8 @@ class User:
 
     def get_user_account_age(self):
         return (
-            datetime.now(timezone.utc)
-            - self.api.get_user(screen_name=self.username).created_at
+                datetime.now(timezone.utc)
+                - self.api.get_user(screen_name=self.username).created_at
         ).days
 
     def get_user_followers_to_following_ratio(self):
@@ -96,7 +108,7 @@ class User:
     def find_verified_followers_count(self):
         verified_followers_count = 0
         for follower in tweepy.Cursor(
-            self.api.get_followers, screen_name=self.username
+                self.api.get_followers, screen_name=self.username
         ).items():
             if follower.verified:
                 verified_followers_count += 1
@@ -122,86 +134,128 @@ class User:
 
     def get_score_from_db(self):
         cursor = self.postgres_connection.cursor()
-        cursor.execute("SELECT score FROM users WHERE id = %s", (self.id,))
+        cursor.execute("SELECT * FROM users WHERE id = %s", (self.id,))
         score = cursor.fetchone()
         cursor.close()
-        return score[0] if score else None
+        return score if score else None
 
-    @property
+    def get_score_status_from_redis(self):
+        """
+        Get job status from redis
+        :return: status
+        """
+        status = self.redis.get(self.username)
+        return status.decode("utf-8") if status else None
+
     def score(self):
-        # check if user has been scored before
-        score = 0
+
+        calculated_score = 0
         if (
-            self.account_age > 3650
-            and self.tweet_count < 10000
-            and self.followers_count < 2000
-            and self.followers_to_following_ratio > 1.2
-            and self.get_tweet_to_retweet_ratio() > 0.75
+                self.account_age > 3650
+                and self.tweet_count < 10000
+                and self.followers_count < 2000
+                and self.followers_to_following_ratio > 1.2
+                and self.get_tweet_to_retweet_ratio() > 0.75
         ):
-            score = 5
+            calculated_score = 5
         elif (
-            self.account_age > 365 * 5
-            and self.tweet_count < 15000
-            and self.followers_count < 2000
-            and self.followers_to_following_ratio > 1.2
-            and self.get_tweet_to_retweet_ratio() > 0.75
+                self.account_age > 365 * 5
+                and self.tweet_count < 15000
+                and self.followers_count < 2000
+                and self.followers_to_following_ratio > 1.2
+                and self.get_tweet_to_retweet_ratio() > 0.75
         ):
-            score = 4
+            calculated_score = 4
         elif (
-            self.account_age > 365 * 3
-            and self.tweet_count < 30000
-            and self.followers_count < 3000
-            and self.followers_to_following_ratio > 1
-            and self.get_tweet_to_retweet_ratio() > 0.75
+                self.account_age > 365 * 3
+                and self.tweet_count < 30000
+                and self.followers_count < 3000
+                and self.followers_to_following_ratio > 1
+                and self.get_tweet_to_retweet_ratio() > 0.75
         ):
-            score = 3
+            calculated_score = 3
         elif (
-            self.account_age > 365 * 2
-            and self.tweet_count < 7000
-            and self.followers_count < 2000
-            and self.followers_to_following_ratio > 1
-            and self.get_tweet_to_retweet_ratio() > 0.75
+                self.account_age > 365 * 2
+                and self.tweet_count < 7000
+                and self.followers_count < 2000
+                and self.followers_to_following_ratio > 1
+                and self.get_tweet_to_retweet_ratio() > 0.75
         ):
-            score = 2
+            calculated_score = 2
         elif (
-            self.account_age > 365
-            and self.tweet_count < 3000
-            and self.followers_count < 2000
-            and self.followers_to_following_ratio > 1
-            and self.get_tweet_to_retweet_ratio() > 0.75
+                self.account_age > 365
+                and self.tweet_count < 3000
+                and self.followers_count < 2000
+                and self.followers_to_following_ratio > 1
+                and self.get_tweet_to_retweet_ratio() > 0.75
         ):
-            score = 1
+            calculated_score = 1
         else:
-            score = 0
+            calculated_score = 0
         if self.check_if_user_verified():
-            score += 3
+            calculated_score += 3
         if self.likes_count / self.tweet_count > 100:
-            score -= 2
+            calculated_score -= 2
         if 0.5 < self.followers_to_following_ratio < 1.5:
-            score -= 2
+            calculated_score -= 2
         if self.verified_followers > 0:
             if self.verified_followers == 1:
-                score += 1
+                calculated_score += 1
             elif 10 > self.verified_followers > 1:
-                score += 2
+                calculated_score += 2
             elif self.verified_followers > 10:
-                score += 3
+                calculated_score += 3
         cursor = self.postgres_connection.cursor()
-        cursor.execute(
-            "INSERT INTO users (id, username, score, created_at, updated_at) VALUES (%s, %s, %s, %s, "
-            "%s)",
-            (
-                self.id,
-                self.username,
-                self.score,
-                datetime.now(timezone.utc),
-                datetime.now(timezone.utc),
-            ),
-        )
+        try:
+            cursor.execute(
+                "INSERT INTO users (id, username,  score, created_at, updated_at) VALUES (%s, %s, %s, %s, "
+                "%s)",
+                (
+                    self.id,
+                    self.username,
+                    calculated_score,
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc),
+                ),
+            )
+        except psycopg2.errors.UniqueViolation:
+            pass
         self.postgres_connection.commit()
         cursor.close()
         self.postgres_connection.close()
-        return score
+        # set job status to done
+        self.redis.set(self.username, "done")
+
+        return calculated_score
+
+
+def run_job():
+    redis_con = redis.Redis(host=getenv("REDIS_HOST"), port=int(getenv("REDIS_PORT")), db=0)
+    # get running jobs
+    pending_jobs = redis_con.lpop("pending_jobs")
+    if pending_jobs:
+        username = pending_jobs.decode("utf-8")
+        # set job status to running
+        redis_con.set(username, "running")
+        # check if key of lock is locked
+        if redis_con.get("lock") == "locked":
+            # if locked
+            logging.log(logging.INFO, "Job is locked")
+        else:
+            redis_con.set("lock", "locked", ex=10800)
+            user = User(username)
+            user.init_user()
+            user.score()
+            # set job status to done
+            redis_con.set(username, "done")
+            redis_con.set("lock", "unlocked")
+
+
+@app.on_event("startup")
+async def startup_event():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_job, "interval", seconds=1, max_instances=1000000)
+    scheduler.start()
 
 
 # fastapi get score api
@@ -213,7 +267,11 @@ async def get_score(user: TwitterUser):
     temp_twitter_user = User(user.screen_name)
     db_score = temp_twitter_user.get_score_from_db()
     if db_score:
-        return {"score": db_score}
-    twitter_user = User(user.screen_name)
-    twitter_user.init_user()
-    return {"score": twitter_user.score}
+        return {"ID": db_score[0], "Username": db_score[1], "Score":db_score[2], "CreatedAt": db_score[3], "UpdatedAt":db_score[4]}
+    # check if user is already in queue
+    if temp_twitter_user.get_score_status_from_redis() == "queued" or temp_twitter_user.get_score_status_from_redis() == "running":
+        return {"error": "User is already queued for scoring"}
+    # add user to pending queue
+    temp_twitter_user.redis.lpush("pending_jobs", user.screen_name)
+    temp_twitter_user.set_redis_job()
+    return {"score": "queued"}
